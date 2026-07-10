@@ -1,6 +1,5 @@
 # development
 out
-*.so
 *.pyc
 __pycache__/
 .config
