@@ -836,7 +836,7 @@ class PrinterProbe:
             toolhead: ToolHead = self.printer.lookup_object("toolhead")
             toolhead.get_last_move_time()
             toolhead_pos = toolhead.get_position()
-            toolhead_pos[2] = toolhead_pos[2] - self.last_z_result
+            toolhead_pos[2] = toolhead_pos[2] - self.last_z_result + self.z_offset
             toolhead.set_position(toolhead_pos, homing_axes="z")
 
     cmd_QUERY_PROBE_help = "Return the status of the z-probe"
