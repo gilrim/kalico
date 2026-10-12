@@ -1539,4 +1539,7 @@ class LoadCellPrinterProbe:
         self._tap_analysis_helper.add_client(callback)
 
     def get_status(self, eventtime):
-        return self._tapping_move.get_status(eventtime)
+        # Expose this probe's result even when it is not the default probe.
+        status = self._tapping_move.get_status(eventtime)
+        status["last_z_result"] = self._printer_probe.last_z_result
+        return status
