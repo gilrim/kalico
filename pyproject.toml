@@ -1,7 +1,7 @@
 [project]
 name = "Kalico"
 version = "0.12.1"
-requires-python = ">=3.9"
+requires-python = ">=3.8"
 dependencies = [
   "cffi==1.17.1 ; python_version >= '3.13'",
   "cffi==1.15.1 ; python_version < '3.13'",
@@ -12,7 +12,7 @@ dependencies = [
   "Jinja2>=3.1.6",
   "markupsafe==2.1.5",
   "matplotlib>=3.9.4",
-  "numpy~=2.0 ; python_version=='3.9'",
+  "numpy~=2.0 ; python_version=='3.8' or python_version=='3.9'",
   "numpy~=2.2 ; python_version>='3.10' and python_version<'3.14'",
   "numpy~=2.3.0 ; python_version>='3.14'",
   "pyserial==3.4",
