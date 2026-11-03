@@ -300,6 +300,9 @@ class LDC1612_ng:
     def add_bulk_sensor_data_client(self, cb):
         self._batch_bulk.add_client(cb)
 
+    def get_sample_rate(self):
+        return self._data_rate
+
     def latched_status(self):
         response = self._ldc1612_ng_latched_status_cmd.send([self._oid])
         return response["status"]

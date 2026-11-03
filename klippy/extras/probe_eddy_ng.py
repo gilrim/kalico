@@ -503,6 +503,7 @@ class ProbeEddy:
 
         # Our virtual endstop wrapper -- used for homing.
         self._endstop_wrapper = ProbeEddyEndstopWrapper(self)
+        self.mcu_probe = self._endstop_wrapper
 
         # There can only be one active sampler at a time
         self._sampler: ProbeEddySampler = None
@@ -2342,6 +2343,30 @@ class ProbeEddyScanningProbe:
         return results
 
 
+class EddyDistanceCollector(probe.ProbeDistanceCollector):
+    def __init__(self, endstop_wrapper: "ProbeEddyEndstopWrapper"):
+        self._endstop_wrapper = endstop_wrapper
+        self._sampler = endstop_wrapper.eddy.start_sampler()
+        self._samples = None
+
+    def finish(self, before_time: float) -> list[probe.ProbeDistanceResult]:
+        if self._samples is not None:
+            return self._samples
+        try:
+            self._sampler.wait_for_sample_at_time(before_time)
+        finally:
+            self._sampler.finish()
+            tap_offset = self._endstop_wrapper.eddy._tap_offset
+            self._samples = [
+                probe.ProbeDistanceResult(time, height + tap_offset)
+                for time, height in zip(self._sampler.times, self._sampler.heights)
+            ]
+        return self._samples
+
+    def sample_rate(self) -> float:
+        return self._endstop_wrapper._sensor.get_sample_rate()
+
+
 # This is a ProbeEndstopWrapper-compatible class,
 # which also forwards the "mcu_probe" methods.
 @final
@@ -2586,6 +2611,11 @@ class ProbeEddyEndstopWrapper:
 
     def query_endstop(self, print_time):
         return False
+
+    def begin_collect_distance(self):
+        if not self.eddy.calibrated():
+            raise self._printer.command_error("Eddy probe not calibrated!")
+        return EddyDistanceCollector(self)
 
     def _setup_sampler(self):
         self._sampler = self.eddy.start_sampler()
