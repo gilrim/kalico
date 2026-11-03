@@ -1563,6 +1563,7 @@ class MCU:
 
         # noncritical mcus
         self.is_non_critical = config.getboolean("is_non_critical", False)
+        self.no_reconnect = config.getboolean("no_reconnect", False)
         if self.is_non_critical and self.get_name() == "mcu":
             raise error("Primary MCU cannot be marked as non-critical!")
         if self.is_non_critical:
@@ -1610,6 +1611,9 @@ class MCU:
         )
 
     def non_critical_recon_event(self, eventtime):
+        # do not support reconnect for some MCUs which are problematic
+        if self.no_reconnect:
+            return self._reactor.NEVER
         success = self.recon_mcu()
         if success:
             self.gcode.respond_info(
