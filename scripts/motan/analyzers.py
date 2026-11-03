@@ -249,7 +249,8 @@ class GenKinematicPosition:
         stepper = name_parts[1]
         status = self.amanager.get_initial_status()
         kin = status["configfile"]["settings"]["printer"]["kinematics"]
-        kin = kin.removeprefix("limited_")
+        if kin.startswith("limited_"):
+            kin = kin[len("limited_"):]
         if kin not in ["cartesian", "corexy"]:
             raise amanager.error("Unsupported kinematics '%s'" % (kin,))
         if stepper not in ["stepper_x", "stepper_y", "stepper_z"]:

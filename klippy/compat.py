@@ -28,7 +28,7 @@ class KlippyPathFinder(importlib.machinery.PathFinder):
         for name in list(sys.modules.keys()):
             if name.startswith("klippy."):
                 sys.modules.setdefault(
-                    name.removeprefix("klippy."),
+                    name[len("klippy."):],
                     sys.modules[name],
                 )
 
@@ -64,7 +64,7 @@ class KlippyPathFinder(importlib.machinery.PathFinder):
         spec = super().find_spec(fullname, path, target)
 
         if spec and spec.name.startswith("klippy."):
-            cls.patch_loader(spec, spec.name.removeprefix("klippy."))
+            cls.patch_loader(spec, spec.name[len("klippy."):])
 
         return spec
 

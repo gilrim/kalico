@@ -161,7 +161,8 @@ class ConfigWrapper:
             return (
                 "python",
                 "\n".join(
-                    line.removeprefix(PYTHON_SCRIPT_PREFIX)
+                    line[len(PYTHON_SCRIPT_PREFIX):]
+                    if line.startswith(PYTHON_SCRIPT_PREFIX) else line
                     for line in value.splitlines()
                 ),
             )
