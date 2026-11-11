@@ -837,7 +837,12 @@ class MCU:
         self.is_non_critical = config.getboolean("is_non_critical", False)
         if self.is_non_critical and self.get_name() == "mcu":
             raise error("Primary MCU cannot be marked as non-critical!")
-        self.no_reconnect = config.getboolean("no_reconnect", False)
+        self.no_reconnect = config.get("no_reconnect", "true").lower()
+        if self.no_reconnect != "printing":
+            # Preserve all the boolean values accepted by existing configs.
+            self.no_reconnect = (
+                "true" if config.getboolean("no_reconnect", True) else "false"
+            )
         if self.is_non_critical:
             self.non_critical_recon_timer = self._reactor.register_timer(
                 self.non_critical_recon_event
@@ -996,10 +1001,21 @@ class MCU:
         self._printer.send_event(self._non_critical_disconnect_event_name)
         self.gcode.respond_info(f"mcu: '{self._name}' disconnected!", log=True)
 
+    def _print_job_active(self, eventtime):
+        print_stats = self._printer.lookup_object("print_stats", None)
+        if print_stats is None:
+            return False
+        state = print_stats.get_status(eventtime).get("state")
+        return state in ("printing", "paused")
+
     def non_critical_recon_event(self, eventtime):
-        # do not support reconnect for some MCUs which are problematic
-        if self.no_reconnect:
+        if not self.non_critical_disconnected:
             return self._reactor.NEVER
+        if self.no_reconnect == "true":
+            return self._reactor.NEVER
+        if self.no_reconnect == "printing" and self._print_job_active(eventtime):
+            return eventtime + self.reconnect_interval
+
         success = self.recon_mcu()
         if success:
             self.gcode.respond_info(
