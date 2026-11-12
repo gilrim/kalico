@@ -135,12 +135,17 @@ def test_resolve_backoff_reports_unrelieved_force_within_bound():
     assert force > 2000
 
 
-def test_add_samples_uses_acquisition_time_not_receipt_time(monkeypatch):
+def test_add_samples_backdates_older_samples_within_a_late_batch(monkeypatch):
+    # A batch read late (e.g. after a backlog) can span real acquisition
+    # time the host never saw. The newest sample is anchored to receipt
+    # time (the best available estimate), but older samples in the same
+    # batch must not share that timestamp: that was the original bug
+    # (a whole batch stamped "now" looks uniformly fresh regardless of
+    # how much real time it actually spans).
     w = p.BoardWorker(None)
-    w.stream_start = 100.0
     w.acq_period = 0.001
     w.seen = [p.DISCARD_SAMPLES] * p.CHANNELS_MAX  # past the startup discard
-    monkeypatch.setattr(p.time, "monotonic", lambda: 999.0)  # late receipt
+    monkeypatch.setattr(p.time, "monotonic", lambda: 1000.0)
     packed = (
         bytes([2, 0])
         + (10).to_bytes(1, "little", signed=True)
@@ -148,11 +153,25 @@ def test_add_samples_uses_acquisition_time_not_receipt_time(monkeypatch):
     )
     w._add_samples({"ch": 0, "datas": packed})
     timestamps = [t for t, _ in w.samples[0]]
-    expected = [
-        100.0 + p.DISCARD_SAMPLES * 0.001,
-        100.0 + (p.DISCARD_SAMPLES + 1) * 0.001,
-    ]
-    assert timestamps == expected
+    assert timestamps == [1000.0 - 0.001, 1000.0]  # oldest first, newest = now
+
+
+def test_add_samples_does_not_drift_from_wall_clock_across_batches(monkeypatch):
+    # Each batch re-anchors to its own receipt time rather than counting
+    # forward from when streaming started, so timestamps can't drift away
+    # from wall-clock if the real rate differs slightly from acq_period
+    # (the bug that made the very first post-fix hardware test fail: a
+    # long-running synthetic clock based on an assumed rate fell behind
+    # real time, so every sample looked stale forever).
+    w = p.BoardWorker(None)
+    w.acq_period = 0.001
+    w.seen = [p.DISCARD_SAMPLES] * p.CHANNELS_MAX
+    one_sample = bytes([1, 0]) + (1).to_bytes(1, "little", signed=True)
+    for fake_now in (100.0, 500.0, 1000.0):
+        monkeypatch.setattr(p.time, "monotonic", lambda t=fake_now: t)
+        w._add_samples({"ch": 0, "datas": one_sample})
+    timestamps = [t for t, _ in w.samples[0]]
+    assert timestamps == [100.0, 500.0, 1000.0]
 
 
 def test_channel_means_requires_minimum_coverage():
