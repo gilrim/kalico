@@ -992,6 +992,36 @@ of the sensors range that was read and the raw value in counts. If the load cell
 is calibrated a force in grams is also reported.
 
 
+### [prtouch_v3]
+
+The following commands are enabled if a
+[prtouch_v3 config section](Config_Reference.md#prtouch_v3) has been
+enabled.
+
+### PRTOUCH_PROBE
+`PRTOUCH_PROBE [HOME=Z]`: Probe nozzle contact with the bed load cells at
+the current XY and Z (Z must already be homed, e.g. by a scan probe). With
+`HOME=Z`, the toolhead's Z position is re-referenced to the detected
+contact point.
+
+### PRTOUCH_DIAGNOSTIC
+`PRTOUCH_DIAGNOSTIC [TIME=5]`: Collects `TIME` seconds (greater than 0, up
+to 60, default 5) of load cell data with no motion and reports the
+per-channel tare and the force noise range, to help verify the board is
+working correctly.
+
+### PRTOUCH_PROBE_ACCURACY
+`PRTOUCH_PROBE_ACCURACY [SAMPLES=10]`: Probes `SAMPLES` times (2 to 100,
+default 10) without changing homing state, and reports the minimum,
+maximum, range, average, median and standard deviation of the results.
+
+### PRTOUCH_Z_OFFSET_APPLY_PROBE
+`PRTOUCH_Z_OFFSET_APPLY_PROBE`: Stages the current gcode Z offset into
+`z_offset` for the next `SAVE_CONFIG`. This is normally invoked via the
+standard `Z_OFFSET_APPLY_PROBE` command once prtouch_v3 is configured as
+the active probe for that command.
+
+
 ### [heaters]
 
 The heaters module is automatically loaded if a heater is defined in

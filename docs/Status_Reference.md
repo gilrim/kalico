@@ -488,6 +488,21 @@ is defined):
   template expansion, the PROBE (or similar) command must be run prior
   to the macro containing this reference.
 
+## prtouch_v3
+
+The following information is available in the
+[prtouch_v3](Config_Reference.md#prtouch_v3) object:
+- `last_z_result`: The Z result of the last PRTOUCH_PROBE command
+  (HOME=Z or not).
+- `last_home_z_result`: The Z result of the last PRTOUCH_PROBE HOME=Z
+  command specifically. Cleared by any homing move, motor-off, or
+  shutdown.
+- `last_stiffness`: The fitted bed stiffness, in counts/um, from the
+  last PRTOUCH_PROBE command.
+- `last_accuracy`: A dict with `samples`, `minimum`, `maximum`,
+  `range`, `average`, `median` and `standard_deviation`, from the last
+  PRTOUCH_PROBE_ACCURACY command.
+
 ## pwm_cycle_time
 
 The following information is available in
