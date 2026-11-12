@@ -182,6 +182,42 @@ def test_channel_means_requires_minimum_coverage():
     assert w.channel_means(since=9.0, channels=1, min_samples=5) == [1.0]
 
 
+def test_drain_discards_samples_read_right_after_a_reader_stall(monkeypatch):
+    # Backdating within a batch (_add_samples) only accounts for the batch's
+    # own span, not time the whole batch spent queued before the host got
+    # around to reading it. A gap between drain cycles means exactly that
+    # may have happened, so those samples must be dropped, not merely
+    # backdated by their own (now understated) span.
+    class _StubParser:
+        def decode(self, payload):
+            data = bytes([1, 0]) + (1).to_bytes(1, "little", signed=True)
+            return [("resault_prtouch_pres", {"ch": 0, "datas": data})]
+
+    class _StubLink:
+        parser = _StubParser()
+
+        def read_payloads(self, timeout):
+            yield b"\x00"
+
+    w = p.BoardWorker(None)
+    w.acq_period = 0.001
+    w.seen = [p.DISCARD_SAMPLES] * p.CHANNELS_MAX  # past the startup discard
+    w.link = _StubLink()
+    t = [1000.0]
+    monkeypatch.setattr(p.time, "monotonic", lambda: t[0])
+
+    w._drain()  # first call: no prior drain to compare against
+    assert len(w.samples[0]) == 1
+
+    t[0] += p.DRAIN_STALL_THRESHOLD + 0.1  # simulate a scheduling stall
+    w._drain()
+    assert len(w.samples[0]) == 1  # the post-stall batch was dropped
+
+    t[0] += 0.01  # cadence back to normal
+    w._drain()
+    assert len(w.samples[0]) == 2  # normal reads resume being recorded
+
+
 class _FakeSerial:
     def __init__(self):
         self.written = []
@@ -194,8 +230,13 @@ class _FakeSerial:
 
 
 class _FakeParser:
+    dictionary = {"config": {"CLOCK_FREQ": 144000000}}
+
     def encode(self, name, **kwargs):
         return b"ENC:" + name.encode()
+
+    def pin(self, name):
+        return 0
 
 
 class _FakeLink:
@@ -251,3 +292,55 @@ def test_drain_link_loss_keeps_board_streaming_flag_for_close():
     assert w.board_streaming is True  # but the MCU might still be emitting
     w.close()
     assert fake.ser.written  # close() still attempted the stop
+
+
+class _FakeOpenStartLink:
+    """identify/get_config succeed, but start_prtouch_pres's ack is lost."""
+
+    def __init__(self, *args, **kwargs):
+        self.parser = _FakeParser()
+        self.seq = 0
+        self.ser = _FakeSerial()
+
+    def identify(self, tries=4):
+        return self.parser
+
+    def query(self, name, want, **kwargs):
+        if name == "get_config":
+            return {"is_config": True, "crc": p.CONFIG_CRC}
+        raise p.serial.SerialException("ack lost for %s" % name)
+
+    def send(self, payload):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakePrtouchConfig:
+    serial_port = "/dev/fake"
+    baud = 230400
+    cfg_regs = 60
+    swap_pin = "PA8"
+    channel_pins = [("PB10", "PB2")]
+
+
+def test_open_and_start_marks_board_streaming_before_the_ack(monkeypatch):
+    # If the MCU receives start_prtouch_pres but its ack is lost (or the
+    # request is cancelled waiting for one), the board may already be
+    # streaming even though open_and_start() ends up raising. board_streaming
+    # must reflect that *before* the query, not after it succeeds, or the
+    # except-clause's close() below has nothing telling it to send a stop.
+    created = {}
+
+    def fake_link(*args, **kwargs):
+        link = _FakeOpenStartLink()
+        created["link"] = link
+        return link
+
+    monkeypatch.setattr(p, "BoardLink", fake_link)
+    w = p.BoardWorker(_FakePrtouchConfig())
+    with pytest.raises(p.serial.SerialException):
+        w.open_and_start()
+    assert created["link"].ser.written  # close()'s fallback stop was sent
+    assert w.board_streaming is False  # cleared after close() attempted it
