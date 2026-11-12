@@ -226,6 +226,26 @@ def fit_contact(points, fit_min):
     return mz - mf / slope, -slope, n, error / -slope
 
 
+def resolve_backoff(measure_force, step, size, max_back, fit_min_force):
+    """Step back (via step(dz), dz > 0) in increments of `size` (the last one
+    clipped to `max_back`) until force relieves to `fit_min_force` or
+    `max_back` is used up; return the force actually reached.
+
+    The bed is compliant, so a single fixed backoff isn't always enough to
+    clear contact on a stiffer bed, and re-taring while still loaded biases
+    the whole fit by the residual force. The caller decides whether the
+    returned force means it's safe to re-tare.
+    """
+    moved = 0.0
+    force = measure_force()
+    while force > fit_min_force and moved < max_back - 1.0e-9:
+        dz = min(size, max_back - moved)
+        step(dz)
+        moved += dz
+        force = measure_force()
+    return force
+
+
 class BoardLink:
     """Blocking serial session with the board. Only used from the worker."""
 
@@ -350,10 +370,13 @@ class BoardWorker(threading.Thread):
         self.stopping = threading.Event()
         self.active = None
         self.link = None
-        self.streaming = False
+        self.streaming = False  # drain loop should keep reading
+        self.board_streaming = False  # the MCU may still be emitting samples
         self.lock = threading.Lock()
         self.samples = [[] for _ in range(CHANNELS_MAX)]
         self.seen = [0] * CHANNELS_MAX
+        self.stream_start = None
+        self.acq_period = None
 
     def check_active(self):
         req = self.active
@@ -425,6 +448,9 @@ class BoardWorker(threading.Thread):
                         logging.exception("prtouch_v3: bad sample packet")
         except serial.SerialException:
             logging.exception("prtouch_v3: board link lost while streaming")
+            # Only the drain loop stops: losing the host-side read says
+            # nothing about whether the MCU itself stopped, so close() must
+            # still try to tell it to (see board_streaming).
             self.streaming = False
 
     def _add_samples(self, vals):
@@ -433,18 +459,25 @@ class BoardWorker(threading.Thread):
             return
         datas = unzip_data(vals["datas"], True)
         skip = max(0, DISCARD_SAMPLES - self.seen[ch])
+        base = self.seen[ch] + skip
         self.seen[ch] += len(datas)
-        now = time.monotonic()
+        # Timestamp by acquisition order at the board's fixed sample rate,
+        # not by host receipt time: after a serial backlog or scheduling
+        # stall, a batch can be *read* late but was *acquired* earlier, and
+        # receipt time would make it look fresher than it is.
         with self.lock:
-            self.samples[ch].extend((now, d) for d in datas[skip:])
+            self.samples[ch].extend(
+                (self.stream_start + (base + i) * self.acq_period, d)
+                for i, d in enumerate(datas[skip:])
+            )
             del self.samples[ch][:-20000]
 
-    def channel_means(self, since, channels):
+    def channel_means(self, since, channels, min_samples):
         with self.lock:
             means = []
             for ch in range(channels):
                 w = [d for t, d in self.samples[ch] if t >= since]
-                if not w:
+                if len(w) < min_samples:
                     return None
                 means.append(sum(w) / len(w))
             return means
@@ -479,6 +512,7 @@ class BoardWorker(threading.Thread):
                 time.sleep(0.2)
             freq = parser.dictionary["config"]["CLOCK_FREQ"]
             acq_ms = ACQ_MS_FAST if p.cfg_regs & 0x30 == 0x30 else ACQ_MS_SLOW
+            self.acq_period = acq_ms / 1000.0
             with self.lock:
                 self.samples = [[] for _ in range(CHANNELS_MAX)]
             self.seen = [0] * CHANNELS_MAX
@@ -496,7 +530,9 @@ class BoardWorker(threading.Thread):
                 add_hold=0,
                 lmt_dead=DEAD_MS,
             )
+            self.stream_start = time.monotonic()
             self.streaming = True
+            self.board_streaming = True
             return parser.dictionary.get("version")
         except Exception:
             self.close()
@@ -510,34 +546,47 @@ class BoardWorker(threading.Thread):
             self.link.query(
                 "stop_prtouch_pres", "ack_prtouch", oid=0, sta_swap=1
             )
+            self.board_streaming = False
         finally:
             self.close()
 
     def close(self):
-        link = self.link
-        if link is not None and self.streaming and link.parser is not None:
-            # Never leave the board streaming: identify can't find its reply
-            # among the sample frames, so the next session couldn't connect.
-            # Fire and forget, this may run while the worker is exiting.
-            try:
-                link.ser.write(
-                    build_block(
-                        link.seq,
-                        link.parser.encode(
-                            "stop_prtouch_pres", oid=0, sta_swap=1
-                        ),
-                    )
-                )
-            except Exception:
-                logging.exception("prtouch_v3: stopping stream on close")
+        # Loop control stops unconditionally; whether the MCU itself needs
+        # telling to stop is tracked separately in board_streaming, which
+        # only clears once we've actually attempted that (below).
         self.streaming = False
-        if self.link is not None:
-            try:
-                self.link.close()
-            except Exception:
-                logging.exception("prtouch_v3: closing serial port failed")
-            finally:
-                self.link = None
+        link = self.link
+        try:
+            if (
+                link is not None
+                and self.board_streaming
+                and link.parser is not None
+            ):
+                # Never leave the board streaming: identify can't find its
+                # reply among the sample frames, so the next session
+                # couldn't connect. Fire and forget, this may run while the
+                # worker is exiting.
+                try:
+                    link.ser.write(
+                        build_block(
+                            link.seq,
+                            link.parser.encode(
+                                "stop_prtouch_pres", oid=0, sta_swap=1
+                            ),
+                        )
+                    )
+                except Exception:
+                    logging.exception("prtouch_v3: stopping stream on close")
+                finally:
+                    self.board_streaming = False
+        finally:
+            if self.link is not None:
+                try:
+                    self.link.close()
+                except Exception:
+                    logging.exception("prtouch_v3: closing serial port failed")
+                finally:
+                    self.link = None
 
 
 ######################################################################
@@ -676,9 +725,20 @@ class PrTouchV3:
         self._pause(self.settle_time)
         since = time.monotonic()
         self._pause(self.sample_time)
-        means = self.worker.channel_means(since, len(self.channel_pins))
+        # Require most of a window's worth of samples, not just one: a
+        # worker that fell behind could otherwise average a near-empty (or
+        # stale, see channel_means) window and return a bogus force.
+        min_samples = max(
+            1, int(0.5 * self.sample_time / self.worker.acq_period)
+        )
+        means = self.worker.channel_means(
+            since, len(self.channel_pins), min_samples
+        )
         if means is None:
-            raise self.gcode.error("prtouch_v3: no samples from the board")
+            raise self.gcode.error(
+                "prtouch_v3: no fresh samples from the board over the last"
+                " %.2fs" % self.sample_time
+            )
         return means
 
     @staticmethod
@@ -785,8 +845,25 @@ class PrTouchV3:
                 if force > self.trigger_force:
                     break
             if not fine:
-                # back off the bed and re-tare before the fine pass
-                z = step(3.0 * size)
+                # Back off until contact force relieves, then re-tare for
+                # the fine pass. Never move above start_z: that's where the
+                # first tare was taken, so force there is known unloaded.
+                def do_step(dz):
+                    nonlocal z
+                    z = step(dz)
+
+                force = resolve_backoff(
+                    lambda: self._force(self._measure(), tare),
+                    do_step,
+                    size,
+                    max(0.0, start_z - z),
+                    self.fit_min_force,
+                )
+                if force > self.fit_min_force:
+                    raise gcmd.error(
+                        "prtouch_v3: contact force did not relieve backing"
+                        " off to the start height; bed may still be loaded"
+                    )
                 tare = self._measure()
         return fine_points
 

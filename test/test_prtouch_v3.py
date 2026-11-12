@@ -95,3 +95,140 @@ def test_command_names_have_no_digits():
         if n.startswith("cmd_") and not n.endswith("_help")
     ]
     assert names and not any(c.isdigit() for n in names for c in n)
+
+
+def test_resolve_backoff_relieves_before_retare_on_compliant_bed():
+    # Stiffness 60 counts/um: 10000-count trigger_force needs ~0.167mm past
+    # contact, more than the old fixed 3*coarse_step=0.15mm backoff could
+    # clear. resolve_backoff must keep stepping until force actually drops.
+    stiffness = 60000.0  # counts/mm
+    depth = [10000.0 / stiffness + 0.02]  # a bit past the trigger threshold
+    step_calls = []
+
+    def measure_force():
+        return max(0.0, stiffness * depth[0])
+
+    def step(dz):
+        step_calls.append(dz)
+        depth[0] = max(0.0, depth[0] - dz)
+
+    force = p.resolve_backoff(
+        measure_force, step, size=0.05, max_back=1.0, fit_min_force=2000
+    )
+    assert force <= 2000
+    assert len(step_calls) > 3  # the old single 3x-step backoff undershot
+
+
+def test_resolve_backoff_reports_unrelieved_force_within_bound():
+    # A bed that never relieves (e.g. something still pressed) must not be
+    # silently accepted as a tare baseline; the caller treats this as a
+    # fault when the returned force is still over fit_min_force.
+    def measure_force():
+        return 999999
+
+    def step(dz):
+        pass
+
+    force = p.resolve_backoff(
+        measure_force, step, size=0.05, max_back=0.15, fit_min_force=2000
+    )
+    assert force > 2000
+
+
+def test_add_samples_uses_acquisition_time_not_receipt_time(monkeypatch):
+    w = p.BoardWorker(None)
+    w.stream_start = 100.0
+    w.acq_period = 0.001
+    w.seen = [p.DISCARD_SAMPLES] * p.CHANNELS_MAX  # past the startup discard
+    monkeypatch.setattr(p.time, "monotonic", lambda: 999.0)  # late receipt
+    packed = (
+        bytes([2, 0])
+        + (10).to_bytes(1, "little", signed=True)
+        + (5).to_bytes(1, "little", signed=True)
+    )
+    w._add_samples({"ch": 0, "datas": packed})
+    timestamps = [t for t, _ in w.samples[0]]
+    expected = [
+        100.0 + p.DISCARD_SAMPLES * 0.001,
+        100.0 + (p.DISCARD_SAMPLES + 1) * 0.001,
+    ]
+    assert timestamps == expected
+
+
+def test_channel_means_requires_minimum_coverage():
+    w = p.BoardWorker(None)
+    w.samples[0] = [(10.0, 1.0), (10.001, 1.0)]
+    assert w.channel_means(since=9.0, channels=1, min_samples=5) is None
+    w.samples[0] += [(10.002, 1.0), (10.003, 1.0), (10.004, 1.0)]
+    assert w.channel_means(since=9.0, channels=1, min_samples=5) == [1.0]
+
+
+class _FakeSerial:
+    def __init__(self):
+        self.written = []
+
+    def write(self, data):
+        self.written.append(data)
+
+    def close(self):
+        pass
+
+
+class _FakeParser:
+    def encode(self, name, **kwargs):
+        return b"ENC:" + name.encode()
+
+
+class _FakeLink:
+    def __init__(self, fail_query=False):
+        self.parser = _FakeParser()
+        self.seq = 0
+        self.ser = _FakeSerial()
+        self.fail_query = fail_query
+
+    def query(self, *args, **kwargs):
+        if self.fail_query:
+            raise p.serial.SerialException("no reply")
+
+    def close(self):
+        pass
+
+
+def test_stop_and_close_still_attempts_stop_when_query_fails():
+    w = p.BoardWorker(None)
+    fake = _FakeLink(fail_query=True)
+    w.link = fake
+    w.streaming = True
+    w.board_streaming = True
+    with pytest.raises(p.serial.SerialException):
+        w.stop_and_close()
+    assert fake.ser.written  # close()'s fallback stop was still sent
+    assert w.link is None
+    assert w.board_streaming is False
+
+
+class _ExplodingLink:
+    def __init__(self):
+        self.parser = _FakeParser()
+        self.seq = 0
+        self.ser = _FakeSerial()
+
+    def read_payloads(self, timeout):
+        raise p.serial.SerialException("link lost")
+        yield  # pragma: no cover - makes this a generator
+
+    def close(self):
+        pass
+
+
+def test_drain_link_loss_keeps_board_streaming_flag_for_close():
+    w = p.BoardWorker(None)
+    fake = _ExplodingLink()
+    w.link = fake
+    w.streaming = True
+    w.board_streaming = True
+    w._drain()
+    assert w.streaming is False  # the drain loop itself stops
+    assert w.board_streaming is True  # but the MCU might still be emitting
+    w.close()
+    assert fake.ser.written  # close() still attempted the stop
