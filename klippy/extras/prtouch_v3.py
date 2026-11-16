@@ -52,6 +52,10 @@ MIN_SAMPLES_PER_MEASUREMENT = 5
 # directly as the unloaded threshold let up to that much residual bias into
 # the tare -- on a ~220 counts/um bed, enough to measurably shift contact.
 BACKOFF_RELIEVED_FRACTION = 0.25
+# A gap this large between drain cycles means the worker fell behind, not
+# just normal jitter around the ~0.05s poll cadence while streaming; samples
+# read right after it are dropped rather than trusted as fresh.
+DRAIN_STALL_THRESHOLD = 0.2
 
 
 ######################################################################
@@ -388,6 +392,7 @@ class BoardWorker(threading.Thread):
         self.samples = [[] for _ in range(CHANNELS_MAX)]
         self.seen = [0] * CHANNELS_MAX
         self.acq_period = None
+        self.last_drain = None
 
     def check_active(self):
         req = self.active
@@ -441,6 +446,19 @@ class BoardWorker(threading.Thread):
                 req.done.set()
 
     def _drain(self):
+        now = time.monotonic()
+        # A gap this large before this call means the worker itself fell
+        # behind (a scheduling stall, a slow request, ...), so the serial
+        # driver may be holding a real backlog. Backdating within a batch
+        # (see _add_samples) only accounts for the batch's own span, not
+        # time it spent queued before the host got to read it at all, so
+        # anything decoded from a post-stall read can't be trusted as fresh
+        # no matter how it's timestamped.
+        stalled = (
+            self.last_drain is not None
+            and now - self.last_drain > DRAIN_STALL_THRESHOLD
+        )
+        self.last_drain = now
         try:
             for p in self.link.read_payloads(0.05):
                 try:
@@ -450,7 +468,7 @@ class BoardWorker(threading.Thread):
                 for name, vals in msgs:
                     if " " in name:  # board debug output
                         logging.info("prtouch_v3: board says %s %s", name, vals)
-                    if name != "resault_prtouch_pres":
+                    if name != "resault_prtouch_pres" or stalled:
                         continue
                     # One bad packet must not end the worker thread
                     try:
@@ -533,6 +551,11 @@ class BoardWorker(threading.Thread):
             with self.lock:
                 self.samples = [[] for _ in range(CHANNELS_MAX)]
             self.seen = [0] * CHANNELS_MAX
+            # Set before sending: if the MCU gets this but its ack is lost,
+            # or the request is cancelled waiting for it, the board may
+            # still be streaming even though this call ends up raising.
+            # close() must attempt its fallback stop in either case.
+            self.board_streaming = True
             link.query(
                 "start_prtouch_pres",
                 "ack_prtouch",
@@ -548,7 +571,6 @@ class BoardWorker(threading.Thread):
                 lmt_dead=DEAD_MS,
             )
             self.streaming = True
-            self.board_streaming = True
             return parser.dictionary.get("version")
         except Exception:
             self.close()
