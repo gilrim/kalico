@@ -1,3 +1,6 @@
+import random
+from types import SimpleNamespace
+
 import pytest
 
 from klippy.extras import prtouch_v3 as p
@@ -376,3 +379,197 @@ def test_open_and_start_marks_board_streaming_before_the_ack(monkeypatch):
         w.open_and_start()
     assert created["link"].ser.written  # close()'s fallback stop was sent
     assert w.board_streaming is False  # cleared after close() attempted it
+
+
+def test_native_crc_matches_independent_reflected_polynomial():
+    def reference(data):
+        crc = 0xFFFF
+        for value in data:
+            crc ^= value
+            for _ in range(8):
+                crc = (crc >> 1) ^ (0x8408 if crc & 1 else 0)
+        return crc
+
+    assert p.crc16(b"123456789") == 0x6F91
+    assert p.crc16(b"") == 0xFFFF
+    rng = random.Random(0)
+    cases = [bytes([value]) for value in range(256)]
+    cases += [
+        bytes(rng.randrange(256) for _ in range(length))
+        for length in range(p.MSG_MAX + 1)
+        for _ in range(4)
+    ]
+    for data in cases:
+        assert p.crc16(data) == reference(data)
+
+
+def test_crc_still_rejects_corrupt_frame_and_recovers():
+    valid = p.build_block(3, b"abc")
+    corrupt = bytearray(valid)
+    corrupt[3] ^= 0x40
+    # Supply enough subsequent traffic to resolve any plausible partial
+    # frame length encountered while resynchronizing past the corrupt frame.
+    payloads, sequences, remaining = p.split_blocks(bytes(corrupt) + valid * 10)
+    assert payloads == [b"abc"] * 10
+    assert sequences == [3] * 10
+    assert remaining == b""
+
+
+def measurement_probe(monkeypatch, feed=None):
+    clock = SimpleNamespace(now=10.0, pauses=[])
+    monkeypatch.setattr(p.time, "monotonic", lambda: clock.now)
+    probe = object.__new__(p.PrTouchV3)
+    probe.settle_time = probe.sample_time = 0.15
+    probe.sample_timeout = 0.5
+    probe.channel_pins = [None] * 4
+    probe.gcode = SimpleNamespace(error=RuntimeError)
+    probe.worker = p.BoardWorker(None)
+    probe.worker.streaming = True
+    probe.worker.acq_period = 0.00078125
+
+    def pause(duration):
+        assert duration >= 0
+        clock.pauses.append(duration)
+        clock.now += duration
+        if feed is not None:
+            feed(probe.worker, clock.now)
+
+    probe._pause = pause
+    return probe, clock
+
+
+def fresh_samples(at, value, count=5):
+    return [(at - index * 0.001, value) for index in range(count)]
+
+
+def test_measure_waits_for_delayed_channel_after_settling(monkeypatch):
+    def feed(worker, now):
+        for ch in range(4):
+            at = now if ch or now >= 10.35 else 10.05
+            worker.samples[ch] = fresh_samples(at, ch + 1)
+
+    probe, clock = measurement_probe(monkeypatch, feed)
+    assert probe._measure() == [1, 2, 3, 4]
+    assert clock.now == pytest.approx(10.36)
+    assert max(clock.pauses[2:]) <= p.MEASUREMENT_RETRY_INTERVAL
+
+
+def test_measure_never_reuses_pre_settle_data(monkeypatch):
+    probe, clock = measurement_probe(monkeypatch)
+    probe.worker.samples = [fresh_samples(10.1, 42) for _ in range(4)]
+    with pytest.raises(RuntimeError, match="ch0=0 samples"):
+        probe._measure()
+    assert clock.now == pytest.approx(10.65)
+
+
+def test_measure_rolling_window_excludes_channels_that_went_stale(monkeypatch):
+    def feed(worker, now):
+        worker.samples[0] = fresh_samples(now, 1) if now >= 10.55 else []
+        for ch in (1, 2, 3):
+            worker.samples[ch] = fresh_samples(min(now, 10.3), ch + 1)
+
+    probe, clock = measurement_probe(monkeypatch, feed)
+    with pytest.raises(RuntimeError, match="ch1=0 samples") as error:
+        probe._measure()
+    assert "ch0=5 samples" in str(error.value)
+    assert "window 0.150s" in str(error.value)
+    assert clock.now == pytest.approx(10.65)
+
+
+def test_measure_timeout_reports_all_missing_channels(monkeypatch):
+    probe, clock = measurement_probe(monkeypatch)
+    with pytest.raises(RuntimeError, match="within 0.500s") as error:
+        probe._measure()
+    for ch in range(4):
+        assert "ch%d=0 samples (age none)" % ch in str(error.value)
+    assert clock.now == pytest.approx(10.65)
+
+
+def test_measure_does_not_accept_data_after_slow_query_exceeds_deadline(
+    monkeypatch,
+):
+    def feed(worker, now):
+        worker.samples = [fresh_samples(now, ch + 1) for ch in range(4)]
+
+    probe, clock = measurement_probe(monkeypatch, feed)
+    query = probe.worker.channel_measurement
+
+    def delayed_query(*args, **kwargs):
+        result = query(*args, **kwargs)
+        clock.now += 0.4
+        return result
+
+    probe.worker.channel_measurement = delayed_query
+    with pytest.raises(RuntimeError, match="within 0.500s"):
+        probe._measure()
+    assert clock.now == pytest.approx(10.7)
+
+
+def test_measure_rejects_reactor_oversleep_before_first_query(monkeypatch):
+    probe, clock = measurement_probe(monkeypatch)
+    pause = probe._pause
+
+    def delayed_pause(duration):
+        pause(duration)
+        if len(clock.pauses) == 2:
+            clock.now += 1.0
+
+    probe._pause = delayed_pause
+    with pytest.raises(RuntimeError, match="no snapshot completed"):
+        probe._measure()
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_measure_aborts_when_stream_stops_while_waiting(monkeypatch, shutdown):
+    def feed(worker, now):
+        if now > 10.31:
+            if shutdown:
+                worker.stopping.set()
+            else:
+                worker.streaming = False
+
+    probe, clock = measurement_probe(monkeypatch, feed)
+    with pytest.raises(RuntimeError, match="board stream stopped"):
+        probe._measure()
+    assert clock.now < 10.65
+
+
+def test_channel_measurement_handles_overlapping_batch_timestamps(monkeypatch):
+    monkeypatch.setattr(p.time, "monotonic", lambda: 10.3)
+    worker = p.BoardWorker(None)
+    worker.acq_period = 0.001
+    worker.samples[0] = [
+        (10.18, 1),
+        (10.25, 2),
+        (10.14, 1000),
+        (10.26, 3),
+        (10.27, 4),
+        (10.28, 5),
+        (10.5, 1000),
+    ]
+    means, coverage = worker.channel_measurement(10.16, 1, 5, window=0.15)
+    assert means == [3]
+    assert coverage[0][0] == 5
+
+
+def test_channel_measurement_overlapping_packets_match_full_history_scan(
+    monkeypatch,
+):
+    worker = p.BoardWorker(None)
+    worker.acq_period = 0.001
+    worker.seen = [p.DISCARD_SAMPLES] * p.CHANNELS_MAX
+    now = [10.0]
+    monkeypatch.setattr(p.time, "monotonic", lambda: now[0])
+    # Build valid compressed batches whose timestamp ranges overlap. A
+    # reverse scan must not stop at the first old sample within a later batch.
+    data = bytes([20]) + bytes(5) + bytes([1]) * 20
+    for i in range(500):
+        now[0] = 10.0 + i * 0.01
+        for ch in range(4):
+            worker._add_samples({"ch": ch, "datas": data})
+    for age in (0.01, 0.015, 0.05, 0.15, 0.4):
+        cutoff = now[0] - age
+        expected = worker.channel_means(cutoff, 4, 5)
+        actual, coverage = worker.channel_measurement(10.0, 4, 5, window=age)
+        assert actual == expected
+        assert all(count >= 5 for count, _ in coverage)

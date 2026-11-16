@@ -18,6 +18,7 @@
 #
 # Protocol reconstructed from Creality's prtouch_v3_wrapper (X2000E firmware
 # V1.1.0.27) and the board's data dictionary.
+import binascii
 import json
 import logging
 import math
@@ -56,6 +57,7 @@ BACKOFF_RELIEVED_FRACTION = 0.25
 # just normal jitter around the ~0.05s poll cadence while streaming; samples
 # read right after it are dropped rather than trusted as fresh.
 DRAIN_STALL_THRESHOLD = 0.2
+MEASUREMENT_RETRY_INTERVAL = 0.02
 
 
 ######################################################################
@@ -63,14 +65,15 @@ DRAIN_STALL_THRESHOLD = 0.2
 ######################################################################
 
 
+# Klipper's reflected CRC-16 (initial value 0xffff) is equivalent to
+# crc_hqx with the input bytes and final word reflected. Both translation
+# and CRC run in C; the old per-byte Python loop dominated decoding on x2000.
+CRC_REVERSE8 = bytes(int(format(i, "08b")[::-1], 2) for i in range(256))
+
+
 def crc16(data):
-    crc = 0xFFFF
-    for b in data:
-        b ^= crc & 0xFF
-        b ^= (b & 0x0F) << 4
-        crc = ((b << 8) | (crc >> 8)) ^ (b >> 4) ^ (b << 3)
-        crc &= 0xFFFF
-    return crc
+    crc = binascii.crc_hqx(data.translate(CRC_REVERSE8), 0xFFFF)
+    return (CRC_REVERSE8[crc & 0xFF] << 8) | CRC_REVERSE8[crc >> 8]
 
 
 def encode_vlq(v):
@@ -514,15 +517,58 @@ class BoardWorker(threading.Thread):
             )
             del self.samples[ch][:-20000]
 
-    def channel_means(self, since, channels, min_samples):
+    def channel_measurement(self, since, channels, min_samples, window=None):
+        # A packet's sample count is one byte. Its backdated timestamps can
+        # overlap earlier packets by at most 255 acquisition periods. Search
+        # past that overlap before stopping, rather than scanning up to 80,000
+        # retained samples under the lock on every retry. Receipt times of
+        # successive packets are monotonic; timestamps *within* their overlap
+        # need not be ordered.
+        now = time.monotonic()
+        cutoff = since if window is None else max(since, now - window)
+        overlap = None if self.acq_period is None else 255 * self.acq_period
         with self.lock:
-            means = []
-            for ch in range(channels):
-                w = [d for t, d in self.samples[ch] if t >= since]
-                if len(w) < min_samples:
-                    return None
-                means.append(sum(w) / len(w))
-            return means
+            snapshots = []
+            newest = []
+            for values in self.samples[:channels]:
+                newest.append(None if not values else values[-1][0])
+                if window is None or overlap is None:
+                    snapshots.append(values[:])
+                    continue
+                recent = []
+                for t, value in reversed(values):
+                    if t < cutoff - overlap:
+                        break
+                    if cutoff <= t <= now:
+                        recent.append((t, value))
+                snapshots.append(recent)
+        selected = [
+            [(t, value) for t, value in values if cutoff <= t <= now]
+            for values in snapshots
+        ]
+        # Account for time spent scanning: retries must not make old readings
+        # eligible merely by extending the original measurement interval.
+        now = time.monotonic()
+        if window is not None:
+            cutoff = max(since, now - window)
+            selected = [
+                [(t, value) for t, value in values if t >= cutoff]
+                for values in selected
+            ]
+        coverage = [
+            (len(values), None if latest is None else now - latest)
+            for values, latest in zip(selected, newest)
+        ]
+        means = None
+        if all(count >= min_samples for count, age in coverage):
+            means = [
+                sum(value for t, value in values) / len(values)
+                for values in selected
+            ]
+        return means, coverage
+
+    def channel_means(self, since, channels, min_samples):
+        return self.channel_measurement(since, channels, min_samples)[0]
 
     # Requests (run on the worker thread)
     def open_and_start(self):
@@ -665,6 +711,11 @@ class PrTouchV3:
         self.step_speed = config.getfloat("step_speed", 2.0, above=0.0)
         self.settle_time = config.getfloat("settle_time", 0.15, minval=0.0)
         self.sample_time = config.getfloat("sample_time", 0.15, above=0.0)
+        self.sample_timeout = config.getfloat(
+            "sample_timeout",
+            max(0.5, self.sample_time + 0.35),
+            above=self.sample_time,
+        )
         self.trigger_force = config.getint("trigger_force", 10000, minval=1)
         self.fit_min_force = config.getint(
             "fit_min_force", 2000, minval=1, maxval=self.trigger_force - 1
@@ -768,21 +819,39 @@ class PrTouchV3:
 
     def _measure(self):
         self._pause(self.settle_time)
-        since = time.monotonic()
+        settled = time.monotonic()
+        deadline = settled + self.sample_timeout
         self._pause(self.sample_time)
-        # A small floor, not a throughput check (see MIN_SAMPLES_PER_
-        # MEASUREMENT): a worker that stalled could otherwise average a
-        # near-empty (or stale, see channel_means) window and return a
-        # bogus force from a single sample.
-        means = self.worker.channel_means(
-            since, len(self.channel_pins), MIN_SAMPLES_PER_MEASUREMENT
-        )
-        if means is None:
-            raise self.gcode.error(
-                "prtouch_v3: no fresh samples from the board over the last"
-                " %.2fs" % self.sample_time
+        coverage = None
+        while time.monotonic() < deadline:
+            if self.worker.stopping.is_set() or not self.worker.streaming:
+                raise self.gcode.error("prtouch_v3: board stream stopped")
+            means, coverage = self.worker.channel_measurement(
+                settled,
+                len(self.channel_pins),
+                MIN_SAMPLES_PER_MEASUREMENT,
+                window=self.sample_time,
             )
-        return means
+            now = time.monotonic()
+            if now > deadline:
+                break
+            if means is not None:
+                return means
+            # A channel can miss one window while the other three deliver.
+            # Wait cooperatively, retaining the post-settle cutoff and a
+            # rolling freshness window. Never move or silently reuse old data.
+            self._pause(min(MEASUREMENT_RETRY_INTERVAL, deadline - now))
+        detail = "no snapshot completed before deadline"
+        if coverage is not None:
+            detail = ", ".join(
+                "ch%d=%d samples (age %s)"
+                % (ch, count, "none" if age is None else "%.3fs" % age)
+                for ch, (count, age) in enumerate(coverage)
+            )
+        raise self.gcode.error(
+            "prtouch_v3: no fresh samples within %.3fs (window %.3fs): %s"
+            % (self.sample_timeout, self.sample_time, detail)
+        )
 
     @staticmethod
     def _force(means, tare):

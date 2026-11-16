@@ -6305,7 +6305,16 @@ channel_pins:
 #settle_time: 0.15
 #   The time, in seconds, to wait after each step before sampling.
 #sample_time: 0.15
-#   The duration, in seconds, of each force sample window.
+#   The duration, in seconds, of the rolling force sample window. Only
+#   samples timestamped after settling are eligible; every configured channel
+#   must provide at least five samples within this window.
+#sample_timeout: 0.5
+#   Maximum wait after settling for fresh coverage from all channels, in
+#   seconds. Defaults to max(0.5, sample_time + 0.35) and must be greater
+#   than sample_time.
+#   The first check follows one full sample_time; missing coverage is retried
+#   every 0.02s until the deadline. Waiting does not widen the freshness window.
+#   A timeout aborts the probe and attempts retraction before serial cleanup.
 #trigger_force: 10000
 #   The force, in raw sensor counts, above which a coarse step is treated
 #   as having made contact with the bed.
