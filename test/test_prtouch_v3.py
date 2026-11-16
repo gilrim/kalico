@@ -218,6 +218,38 @@ def test_drain_discards_samples_read_right_after_a_reader_stall(monkeypatch):
     assert len(w.samples[0]) == 2  # normal reads resume being recorded
 
 
+def test_drain_discards_samples_from_a_stall_inside_a_single_call(monkeypatch):
+    # A stall can happen *during* read_payloads() itself (e.g. the OS
+    # suspends serial.read() mid-call), not just in the gap before this call
+    # started. Checking only the pre-call gap misses this: the call still
+    # starts on time, decodes a small-looking batch, and by the time the
+    # *next* call detects the elapsed gap, this one's samples are already
+    # recorded.
+    class _StubParser:
+        def decode(self, payload):
+            data = bytes([1, 0]) + (1).to_bytes(1, "little", signed=True)
+            return [("resault_prtouch_pres", {"ch": 0, "datas": data})]
+
+    t = [1000.0]
+
+    class _StubLink:
+        parser = _StubParser()
+
+        def read_payloads(self, timeout):
+            yield b"\x00"  # read before the stall
+            t[0] += p.DRAIN_STALL_THRESHOLD + 0.1  # the stall happens here
+            yield b"\x00"  # decoded only once the read resumes
+
+    w = p.BoardWorker(None)
+    w.acq_period = 0.001
+    w.seen = [p.DISCARD_SAMPLES] * p.CHANNELS_MAX
+    w.link = _StubLink()
+    monkeypatch.setattr(p.time, "monotonic", lambda: t[0])
+
+    w._drain()
+    assert len(w.samples[0]) == 0  # both payloads from this call are dropped
+
+
 class _FakeSerial:
     def __init__(self):
         self.written = []

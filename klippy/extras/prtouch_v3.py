@@ -446,41 +446,48 @@ class BoardWorker(threading.Thread):
                 req.done.set()
 
     def _drain(self):
-        now = time.monotonic()
-        # A gap this large before this call means the worker itself fell
-        # behind (a scheduling stall, a slow request, ...), so the serial
-        # driver may be holding a real backlog. Backdating within a batch
-        # (see _add_samples) only accounts for the batch's own span, not
-        # time it spent queued before the host got to read it at all, so
-        # anything decoded from a post-stall read can't be trusted as fresh
-        # no matter how it's timestamped.
-        stalled = (
+        start = time.monotonic()
+        # A gap before this call started means the worker itself fell behind
+        # between drain cycles (a scheduling stall, a slow request, ...).
+        # That's necessary but not sufficient: a read can also stall *inside*
+        # this very call (e.g. the OS suspends serial.read() mid-read), in
+        # which case this call still starts on time but returns a backlog
+        # anyway. So decode everything first, without acting on it, and only
+        # decide whether to trust it once this cycle's own total elapsed
+        # time is known -- backdating within a batch (see _add_samples) only
+        # accounts for the batch's own span, not time spent stalled before
+        # or during the read that produced it.
+        gapped = (
             self.last_drain is not None
-            and now - self.last_drain > DRAIN_STALL_THRESHOLD
+            and start - self.last_drain > DRAIN_STALL_THRESHOLD
         )
-        self.last_drain = now
+        self.last_drain = start
+        collected = []
         try:
             for p in self.link.read_payloads(0.05):
                 try:
-                    msgs = self.link.parser.decode(p)
+                    collected.append(self.link.parser.decode(p))
                 except IndexError:
                     continue
-                for name, vals in msgs:
-                    if " " in name:  # board debug output
-                        logging.info("prtouch_v3: board says %s %s", name, vals)
-                    if name != "resault_prtouch_pres" or stalled:
-                        continue
-                    # One bad packet must not end the worker thread
-                    try:
-                        self._add_samples(vals)
-                    except (IndexError, KeyError, ValueError):
-                        logging.exception("prtouch_v3: bad sample packet")
         except serial.SerialException:
             logging.exception("prtouch_v3: board link lost while streaming")
             # Only the drain loop stops: losing the host-side read says
             # nothing about whether the MCU itself stopped, so close() must
             # still try to tell it to (see board_streaming).
             self.streaming = False
+            return
+        stalled = gapped or (time.monotonic() - start > DRAIN_STALL_THRESHOLD)
+        for msgs in collected:
+            for name, vals in msgs:
+                if " " in name:  # board debug output
+                    logging.info("prtouch_v3: board says %s %s", name, vals)
+                if name != "resault_prtouch_pres" or stalled:
+                    continue
+                # One bad packet must not end the worker thread
+                try:
+                    self._add_samples(vals)
+                except (IndexError, KeyError, ValueError):
+                    logging.exception("prtouch_v3: bad sample packet")
 
     def _add_samples(self, vals):
         ch = vals["ch"]
