@@ -40,6 +40,18 @@ DEAD_MS = 128
 DISCARD_SAMPLES = 20  # first samples after start can read doubled
 CONFIG_CRC = 0x7623  # finalize_config crc, to recognise our own config
 CHANNELS_MAX = 4
+# Sanity floor for a measurement window: the real per-channel sample rate is
+# serial-link-limited, not the configured acq rate (observed ~650-680/s vs a
+# naive ~1280/s from acq_tick on a K1 Max), so this only needs to catch a
+# near-empty window (stall/backlog), not validate full throughput.
+MIN_SAMPLES_PER_MEASUREMENT = 5
+# Fraction of fit_min_force treated as "relieved" before re-taring after the
+# coarse backoff. fit_min_force itself is deliberately well above the real
+# noise floor (chosen so only confidently-loaded points enter the line fit,
+# e.g. 2000 vs ~500 counts of measured noise on a K1 Max), so reusing it
+# directly as the unloaded threshold let up to that much residual bias into
+# the tare -- on a ~220 counts/um bed, enough to measurably shift contact.
+BACKOFF_RELIEVED_FRACTION = 0.25
 
 
 ######################################################################
@@ -375,7 +387,6 @@ class BoardWorker(threading.Thread):
         self.lock = threading.Lock()
         self.samples = [[] for _ in range(CHANNELS_MAX)]
         self.seen = [0] * CHANNELS_MAX
-        self.stream_start = None
         self.acq_period = None
 
     def check_active(self):
@@ -459,16 +470,22 @@ class BoardWorker(threading.Thread):
             return
         datas = unzip_data(vals["datas"], True)
         skip = max(0, DISCARD_SAMPLES - self.seen[ch])
-        base = self.seen[ch] + skip
         self.seen[ch] += len(datas)
-        # Timestamp by acquisition order at the board's fixed sample rate,
-        # not by host receipt time: after a serial backlog or scheduling
-        # stall, a batch can be *read* late but was *acquired* earlier, and
-        # receipt time would make it look fresher than it is.
+        kept = datas[skip:]
+        n = len(kept)
+        # Timestamp each sample by its acquisition offset *within this
+        # batch*, counting back from receipt time for the last one, instead
+        # of giving the whole batch the same receipt timestamp: after a
+        # serial backlog, a batch read late can span real acquisition time
+        # the host never saw, and the older samples in it would otherwise
+        # look as fresh as the most recent one. Anchoring to receipt time
+        # per batch (rather than a running clock from stream start) avoids
+        # that estimate drifting from wall time over a long session.
+        now = time.monotonic()
         with self.lock:
             self.samples[ch].extend(
-                (self.stream_start + (base + i) * self.acq_period, d)
-                for i, d in enumerate(datas[skip:])
+                (now - (n - 1 - i) * self.acq_period, d)
+                for i, d in enumerate(kept)
             )
             del self.samples[ch][:-20000]
 
@@ -530,7 +547,6 @@ class BoardWorker(threading.Thread):
                 add_hold=0,
                 lmt_dead=DEAD_MS,
             )
-            self.stream_start = time.monotonic()
             self.streaming = True
             self.board_streaming = True
             return parser.dictionary.get("version")
@@ -725,14 +741,12 @@ class PrTouchV3:
         self._pause(self.settle_time)
         since = time.monotonic()
         self._pause(self.sample_time)
-        # Require most of a window's worth of samples, not just one: a
-        # worker that fell behind could otherwise average a near-empty (or
-        # stale, see channel_means) window and return a bogus force.
-        min_samples = max(
-            1, int(0.5 * self.sample_time / self.worker.acq_period)
-        )
+        # A small floor, not a throughput check (see MIN_SAMPLES_PER_
+        # MEASUREMENT): a worker that stalled could otherwise average a
+        # near-empty (or stale, see channel_means) window and return a
+        # bogus force from a single sample.
         means = self.worker.channel_means(
-            since, len(self.channel_pins), min_samples
+            since, len(self.channel_pins), MIN_SAMPLES_PER_MEASUREMENT
         )
         if means is None:
             raise self.gcode.error(
@@ -852,14 +866,15 @@ class PrTouchV3:
                     nonlocal z
                     z = step(dz)
 
+                relieved = self.fit_min_force * BACKOFF_RELIEVED_FRACTION
                 force = resolve_backoff(
                     lambda: self._force(self._measure(), tare),
                     do_step,
                     size,
                     max(0.0, start_z - z),
-                    self.fit_min_force,
+                    relieved,
                 )
-                if force > self.fit_min_force:
+                if force > relieved:
                     raise gcmd.error(
                         "prtouch_v3: contact force did not relieve backing"
                         " off to the start height; bed may still be loaded"
