@@ -6265,6 +6265,70 @@ sensor_type:
 
 See [Tap Quality Components](Load_Cell.md#tap-quality-components) for more details on maximum for tap quality.
 
+### [prtouch_v3]
+
+Z homing via a Creality K1-MAX-L_V23 bed load-cell board (CH32V203 + 4x
+CS1237). The board runs Creality's own firmware and command set, not
+Kalico, so it is not configured as an `[mcu]`; this module owns its serial
+port directly and provides its own Z-referencing commands instead of
+registering as a [probe](#probe) or [load_cell_probe](#load_cell_probe).
+See [G-Codes.md](G-Codes.md#prtouch_v3) for the commands this exposes.
+
+```
+[prtouch_v3]
+serial:
+#   The serial port the board is connected to, e.g. /dev/ttyS9. This
+#   parameter must be provided.
+swap_pin:
+#   The mcu pin wired to the board's SYNC line. This parameter must be
+#   provided.
+channel_pins:
+#   Comma-separated clk:sdo pin pairs, one per load cell channel (1 to 4
+#   pairs), e.g. PB10:PB2, PB1:PB0, PA7:PA6, PA5:PA4. This parameter must
+#   be provided.
+#baud: 230400
+#   The baud rate to use when connecting to the board.
+#cfg_regs: 60
+#   The CS1237 configuration register value sent to the board (the
+#   default, 0x3C, selects 1280Hz sampling and PGA 128, matching the
+#   board's factory configuration).
+#z_offset: 0.0
+#   The vertical distance (in mm) between the nozzle's trigger point and
+#   the print surface, as in "[probe]".
+#coarse_step: 0.05
+#fine_step: 0.01
+#   The step size, in mm, used while searching for contact (coarse) and
+#   while sampling the force-vs-depth line used to fit the contact point
+#   (fine).
+#step_speed: 2.0
+#   The speed, in mm/s, of each step while probing.
+#settle_time: 0.15
+#   The time, in seconds, to wait after each step before sampling.
+#sample_time: 0.15
+#   The duration, in seconds, of each force sample window.
+#trigger_force: 10000
+#   The force, in raw sensor counts, above which a coarse step is treated
+#   as having made contact with the bed.
+#fit_min_force: 2000
+#   Fine-pass samples above this force (in raw sensor counts) are used to
+#   fit the contact line. Must be less than trigger_force.
+#force_safety_limit: 300000
+#   The probe aborts if the measured force (in raw sensor counts) exceeds
+#   this value. Must be greater than trigger_force.
+#max_travel: 3.0
+#   The maximum downward travel, in mm, allowed before a probe is
+#   considered to have failed to find contact.
+#min_stiffness: 50.0
+#max_stiffness: 1500.0
+#   The acceptable range of fitted bed stiffness, in counts/um, for a
+#   probe result to be accepted.
+#max_fit_error: 0.005
+#   The maximum acceptable residual, in mm, of the fitted contact line.
+#max_extrapolation: 0.1
+#   The maximum allowed distance, in mm, between the fit's zero-force
+#   intercept and the nearest actual fine-pass sample.
+```
+
 ## Board specific hardware support
 
 ### [indx]
