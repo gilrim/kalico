@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from klippy.extras import prtouch_v3 as p
+from klippy.extras import load_cell_v23 as p
 
 
 @pytest.mark.parametrize(
@@ -91,10 +91,10 @@ def test_message_parser():
 
 
 def test_command_names_have_no_digits():
-    # klippy's gcode parser splits "PRTOUCH_V3_PROBE" into "PRTOUCH_V3" + junk
+    # Digits split extended G-code names: V23_PROBE is parsed as V23.
     names = [
         n[len("cmd_") :]
-        for n in vars(p.PrTouchV3)
+        for n in vars(p.V23LoadCell)
         if n.startswith("cmd_") and not n.endswith("_help")
     ]
     assert names and not any(c.isdigit() for n in names for c in n)
@@ -352,7 +352,7 @@ class _FakeOpenStartLink:
         pass
 
 
-class _FakePrtouchConfig:
+class _FakeV23Config:
     serial_port = "/dev/fake"
     baud = 230400
     cfg_regs = 60
@@ -374,7 +374,7 @@ def test_open_and_start_marks_board_streaming_before_the_ack(monkeypatch):
         return link
 
     monkeypatch.setattr(p, "BoardLink", fake_link)
-    w = p.BoardWorker(_FakePrtouchConfig())
+    w = p.BoardWorker(_FakeV23Config())
     with pytest.raises(p.serial.SerialException):
         w.open_and_start()
     assert created["link"].ser.written  # close()'s fallback stop was sent
@@ -418,7 +418,7 @@ def test_crc_still_rejects_corrupt_frame_and_recovers():
 def measurement_probe(monkeypatch, feed=None):
     clock = SimpleNamespace(now=10.0, pauses=[])
     monkeypatch.setattr(p.time, "monotonic", lambda: clock.now)
-    probe = object.__new__(p.PrTouchV3)
+    probe = object.__new__(p.V23LoadCell)
     probe.settle_time = probe.sample_time = 0.15
     probe.sample_timeout = 0.5
     probe.channel_pins = [None] * 4

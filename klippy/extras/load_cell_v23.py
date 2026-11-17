@@ -1,4 +1,4 @@
-# Z homing with Creality prtouch_v3 load cell boards (K1-MAX-L_V23)
+# Z homing with the Creality K1-MAX-L_V23 leveling board
 #
 # Copyright (C) 2026 gilrim
 #
@@ -33,7 +33,7 @@ import serial
 
 MSG_MIN, MSG_MAX, MSG_SYNC = 5, 64, 0x7E
 IDENTIFY_CHUNK = 40
-# prtouch_v3 defaults for CS1237 boards (pres_cfg_regs 0x3C = 1280Hz/PGA128):
+# Creality prtouch_v3 protocol defaults for CS1237 boards (pres_cfg_regs 0x3C = 1280Hz/PGA128):
 # acq_tkms 0.78125ms when cfg_regs & 0x30 == 0x30, ded_tkms 128
 DEFAULT_CFG_REGS = 60
 ACQ_MS_FAST, ACQ_MS_SLOW = 0.78125, 1.5625
@@ -382,9 +382,9 @@ class _Request:
 
 
 class BoardWorker(threading.Thread):
-    def __init__(self, prtouch):
+    def __init__(self, probe):
         super().__init__(daemon=True)
-        self.prtouch = prtouch
+        self.probe = probe
         self.requests = queue.Queue()
         self.stopping = threading.Event()
         self.active = None
@@ -436,7 +436,7 @@ class BoardWorker(threading.Thread):
                     self._drain()
         except Exception:
             # Thread exceptions don't reach the klippy log otherwise
-            logging.exception("prtouch_v3: board worker died")
+            logging.exception("load_cell_v23: board worker died")
             raise
         finally:
             self.close()
@@ -473,7 +473,7 @@ class BoardWorker(threading.Thread):
                 except IndexError:
                     continue
         except serial.SerialException:
-            logging.exception("prtouch_v3: board link lost while streaming")
+            logging.exception("load_cell_v23: board link lost while streaming")
             # Only the drain loop stops: losing the host-side read says
             # nothing about whether the MCU itself stopped, so close() must
             # still try to tell it to (see board_streaming).
@@ -483,14 +483,14 @@ class BoardWorker(threading.Thread):
         for msgs in collected:
             for name, vals in msgs:
                 if " " in name:  # board debug output
-                    logging.info("prtouch_v3: board says %s %s", name, vals)
+                    logging.info("load_cell_v23: board says %s %s", name, vals)
                 if name != "resault_prtouch_pres" or stalled:
                     continue
                 # One bad packet must not end the worker thread
                 try:
                     self._add_samples(vals)
                 except (IndexError, KeyError, ValueError):
-                    logging.exception("prtouch_v3: bad sample packet")
+                    logging.exception("load_cell_v23: bad sample packet")
 
     def _add_samples(self, vals):
         ch = vals["ch"]
@@ -572,7 +572,7 @@ class BoardWorker(threading.Thread):
 
     # Requests (run on the worker thread)
     def open_and_start(self):
-        p = self.prtouch
+        p = self.probe
         self.link = link = BoardLink(p.serial_port, p.baud, self.check_active)
         try:
             parser = link.identify()
@@ -667,7 +667,7 @@ class BoardWorker(threading.Thread):
                         )
                     )
                 except Exception:
-                    logging.exception("prtouch_v3: stopping stream on close")
+                    logging.exception("load_cell_v23: stopping stream on close")
                 finally:
                     self.board_streaming = False
         finally:
@@ -675,17 +675,19 @@ class BoardWorker(threading.Thread):
                 try:
                     self.link.close()
                 except Exception:
-                    logging.exception("prtouch_v3: closing serial port failed")
+                    logging.exception(
+                        "load_cell_v23: closing serial port failed"
+                    )
                 finally:
                     self.link = None
 
 
 ######################################################################
-# The [prtouch_v3] module
+# The [load_cell_v23] module
 ######################################################################
 
 
-class PrTouchV3:
+class V23LoadCell:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
@@ -697,12 +699,12 @@ class PrTouchV3:
         try:
             self.channel_pins = [tuple(p.split(":")) for p in pairs if p]
         except ValueError:
-            raise config.error("prtouch_v3: channel_pins are clk:sdo pairs")
+            raise config.error("load_cell_v23: channel_pins are clk:sdo pairs")
         if not 1 <= len(self.channel_pins) <= CHANNELS_MAX or any(
             len(p) != 2 for p in self.channel_pins
         ):
             raise config.error(
-                "prtouch_v3: channel_pins needs 1 to 4 clk:sdo pin pairs"
+                "load_cell_v23: channel_pins needs 1 to 4 clk:sdo pin pairs"
             )
         self.cfg_regs = config.getint("cfg_regs", DEFAULT_CFG_REGS, minval=0)
         self.z_offset = config.getfloat("z_offset", 0.0)
@@ -751,22 +753,22 @@ class PrTouchV3:
             "stepper_enable:motor_off", self._invalidate_home
         )
         self.gcode.register_command(
-            "PRTOUCH_PROBE",
-            self.cmd_PRTOUCH_PROBE,
-            desc=self.cmd_PRTOUCH_PROBE_help,
+            "BED_LOAD_CELL_PROBE",
+            self.cmd_BED_LOAD_CELL_PROBE,
+            desc=self.cmd_BED_LOAD_CELL_PROBE_help,
         )
         self.gcode.register_command(
-            "PRTOUCH_DIAGNOSTIC",
-            self.cmd_PRTOUCH_DIAGNOSTIC,
-            desc=self.cmd_PRTOUCH_DIAGNOSTIC_help,
+            "BED_LOAD_CELL_DIAGNOSTIC",
+            self.cmd_BED_LOAD_CELL_DIAGNOSTIC,
+            desc=self.cmd_BED_LOAD_CELL_DIAGNOSTIC_help,
         )
         self.gcode.register_command(
-            "PRTOUCH_PROBE_ACCURACY",
-            self.cmd_PRTOUCH_PROBE_ACCURACY,
+            "BED_LOAD_CELL_PROBE_ACCURACY",
+            self.cmd_BED_LOAD_CELL_PROBE_ACCURACY,
             desc="Report nozzle contact repeatability",
         )
         self.gcode.register_command(
-            "PRTOUCH_Z_OFFSET_APPLY_PROBE",
+            "BED_LOAD_CELL_Z_OFFSET_APPLY_PROBE",
             self.cmd_Z_OFFSET_APPLY_PROBE,
             desc="Adjust the load cell z_offset",
         )
@@ -783,7 +785,7 @@ class PrTouchV3:
         if self.worker.is_alive():
             self.worker.join(1.0)
             if self.worker.is_alive():
-                logging.error("prtouch_v3: serial worker failed to exit")
+                logging.error("load_cell_v23: serial worker failed to exit")
 
     def get_status(self, eventtime):
         return {
@@ -796,7 +798,9 @@ class PrTouchV3:
     # Worker access: post a request, keep the reactor running until done
     def _call(self, func, timeout=10.0):
         if not self.worker.is_alive() or self.worker.stopping.is_set():
-            raise self.gcode.error("prtouch_v3: board worker is disconnected")
+            raise self.gcode.error(
+                "load_cell_v23: board worker is disconnected"
+            )
         req = _Request(func, timeout)
         self.worker.requests.put(req)
         end = self.reactor.monotonic() + timeout
@@ -805,13 +809,13 @@ class PrTouchV3:
                 now = self.reactor.pause(self.reactor.monotonic() + 0.02)
                 if now > end:
                     raise self.gcode.error(
-                        "prtouch_v3: board request timed out"
+                        "load_cell_v23: board request timed out"
                     )
         finally:
             if not req.done.is_set():
                 req.cancelled.set()
         if req.error is not None:
-            raise self.gcode.error(f"prtouch_v3: {req.error}")
+            raise self.gcode.error(f"load_cell_v23: {req.error}")
         return req.result
 
     def _pause(self, seconds):
@@ -825,7 +829,7 @@ class PrTouchV3:
         coverage = None
         while time.monotonic() < deadline:
             if self.worker.stopping.is_set() or not self.worker.streaming:
-                raise self.gcode.error("prtouch_v3: board stream stopped")
+                raise self.gcode.error("load_cell_v23: board stream stopped")
             means, coverage = self.worker.channel_measurement(
                 settled,
                 len(self.channel_pins),
@@ -849,7 +853,7 @@ class PrTouchV3:
                 for ch, (count, age) in enumerate(coverage)
             )
         raise self.gcode.error(
-            "prtouch_v3: no fresh samples within %.3fs (window %.3fs): %s"
+            "load_cell_v23: no fresh samples within %.3fs (window %.3fs): %s"
             % (self.sample_timeout, self.sample_time, detail)
         )
 
@@ -860,7 +864,7 @@ class PrTouchV3:
 
     def _start(self):
         version = self._call(self.worker.open_and_start)
-        logging.info("prtouch_v3: streaming from %s", version)
+        logging.info("load_cell_v23: streaming from %s", version)
         self._pause(0.3)
 
     def _stop(self):
@@ -868,7 +872,7 @@ class PrTouchV3:
             self._call(self.worker.stop_and_close)
             return True
         except Exception:
-            logging.exception("prtouch_v3: stop failed")
+            logging.exception("load_cell_v23: stop failed")
             # Termination closes the port on the worker. Never wait for a
             # second request on an unresponsive worker or reuse its session.
             self.worker.shutdown()
@@ -878,7 +882,7 @@ class PrTouchV3:
         toolhead = self.printer.lookup_object("toolhead")
         curtime = self.reactor.monotonic()
         if "z" not in toolhead.get_status(curtime)["homed_axes"]:
-            raise gcmd.error("prtouch_v3: must home z before probing")
+            raise gcmd.error("load_cell_v23: must home z before probing")
 
         def step(dz):
             pos = toolhead.get_position()
@@ -902,17 +906,17 @@ class PrTouchV3:
             except Exception:
                 if error is None:
                     raise
-                logging.exception("prtouch_v3: retract after failure failed")
+                logging.exception("load_cell_v23: retract after failure failed")
             finally:
                 stopped = self._stop()
         if not stopped:
             raise gcmd.error(
-                "prtouch_v3: board cleanup failed; restart Klipper"
+                "load_cell_v23: board cleanup failed; restart Klipper"
             )
         fit = fit_contact(fine_points, self.fit_min_force)
         if fit is None:
             raise gcmd.error(
-                "prtouch_v3: too few points past contact to fit; lower"
+                "load_cell_v23: too few points past contact to fit; lower"
                 " fit_min_force or raise trigger_force"
             )
         z0, stiffness, count, residual = fit
@@ -924,7 +928,7 @@ class PrTouchV3:
             or not start_z - self.max_travel <= z0 <= start_z
         ):
             raise gcmd.error(
-                "prtouch_v3: unreliable contact fit (stiffness %.1f counts/um,"
+                "load_cell_v23: unreliable contact fit (stiffness %.1f counts/um,"
                 " residual %.4fmm, extrapolation %.4fmm)"
                 % (stiffness / 1000.0, residual, z0 - nearest)
             )
@@ -941,15 +945,15 @@ class PrTouchV3:
             while True:
                 if start_z - z + size > self.max_travel + 1.0e-9:
                     raise gcmd.error(
-                        "prtouch_v3: no contact within %.2fmm"
+                        "load_cell_v23: no contact within %.2fmm"
                         % (self.max_travel,)
                     )
                 z = step(-size)
                 force = self._force(self._measure(), tare)
-                logging.info("prtouch_v3: z=%.4f force=%d", z, force)
+                logging.info("load_cell_v23: z=%.4f force=%d", z, force)
                 if force > self.force_safety_limit:
                     raise gcmd.error(
-                        "prtouch_v3: force %d over force_safety_limit %d"
+                        "load_cell_v23: force %d over force_safety_limit %d"
                         % (force, self.force_safety_limit)
                     )
                 if fine:
@@ -974,25 +978,27 @@ class PrTouchV3:
                 )
                 if force > relieved:
                     raise gcmd.error(
-                        "prtouch_v3: contact force did not relieve backing"
+                        "load_cell_v23: contact force did not relieve backing"
                         " off to the start height; bed may still be loaded"
                     )
                 tare = self._measure()
         return fine_points
 
-    cmd_PRTOUCH_PROBE_help = "Probe nozzle contact with the bed load cells"
+    cmd_BED_LOAD_CELL_PROBE_help = (
+        "Probe nozzle contact with the bed load cells"
+    )
 
-    def cmd_PRTOUCH_PROBE(self, gcmd):
+    def cmd_BED_LOAD_CELL_PROBE(self, gcmd):
         home = gcmd.get("HOME", "").lower()
         if home not in ("", "z"):
-            raise gcmd.error("prtouch_v3: HOME must be Z")
+            raise gcmd.error("load_cell_v23: HOME must be Z")
         if home:
             self._invalidate_home()
         z0, stiffness, count = self.run_probe(gcmd)
         self.last_z_result = z0
         self.last_stiffness = stiffness / 1000.0
         gcmd.respond_info(
-            "prtouch_v3: contact at z=%.4f (fit over %d steps, %.0f"
+            "load_cell_v23: contact at z=%.4f (fit over %d steps, %.0f"
             " counts/um)" % (z0, count, self.last_stiffness)
         )
         if home:
@@ -1002,9 +1008,9 @@ class PrTouchV3:
             pos[2] = pos[2] - z0 + self.z_offset
             toolhead.set_position(pos, homing_axes="z")
             self.last_home_z_result = z0
-            gcmd.respond_info("prtouch_v3: z homed to the contact point")
+            gcmd.respond_info("load_cell_v23: z homed to the contact point")
 
-    def cmd_PRTOUCH_PROBE_ACCURACY(self, gcmd):
+    def cmd_BED_LOAD_CELL_PROBE_ACCURACY(self, gcmd):
         count = gcmd.get_int("SAMPLES", 10, minval=2, maxval=100)
         self.last_accuracy = None
         # Each result is one physical tap, without changing homing status.
@@ -1023,7 +1029,7 @@ class PrTouchV3:
             "standard_deviation": stddev,
         }
         gcmd.respond_info(
-            "prtouch_v3: probe accuracy results: maximum %.6f, minimum %.6f,"
+            "load_cell_v23: probe accuracy results: maximum %.6f, minimum %.6f,"
             " range %.6f, average %.6f, median %.6f, standard deviation %.6f"
             % (max(zs), min(zs), max(zs) - min(zs), mean, median, stddev)
         )
@@ -1036,17 +1042,17 @@ class PrTouchV3:
             return
         value = self.z_offset - offset
         self.printer.lookup_object("configfile").set(
-            "prtouch_v3", "z_offset", "%.3f" % value
+            "load_cell_v23", "z_offset", "%.3f" % value
         )
         gcmd.respond_info(
-            "prtouch_v3: z_offset: %.3f\n"
+            "load_cell_v23: z_offset: %.3f\n"
             "The SAVE_CONFIG command will update the printer config file\n"
             "with the above and restart the printer." % value
         )
 
-    cmd_PRTOUCH_DIAGNOSTIC_help = "Report load cell readings and noise"
+    cmd_BED_LOAD_CELL_DIAGNOSTIC_help = "Report load cell readings and noise"
 
-    def cmd_PRTOUCH_DIAGNOSTIC(self, gcmd):
+    def cmd_BED_LOAD_CELL_DIAGNOSTIC(self, gcmd):
         duration = gcmd.get_float("TIME", 5.0, above=0.0, maxval=60.0)
         try:
             self._start()
@@ -1057,7 +1063,7 @@ class PrTouchV3:
                 forces.append(self._force(self._measure(), tare))
         finally:
             self._stop()
-        msg = ["prtouch_v3: tare per channel:"]
+        msg = ["load_cell_v23: tare per channel:"]
         msg += ["  ch%d: %d" % (i, t) for i, t in enumerate(tare)]
         msg.append(
             "force over %.1fs: min %d max %d (counts, %d readings)"
@@ -1067,4 +1073,4 @@ class PrTouchV3:
 
 
 def load_config(config):
-    return PrTouchV3(config)
+    return V23LoadCell(config)

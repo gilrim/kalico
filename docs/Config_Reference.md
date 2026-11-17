@@ -6265,17 +6265,17 @@ sensor_type:
 
 See [Tap Quality Components](Load_Cell.md#tap-quality-components) for more details on maximum for tap quality.
 
-### [prtouch_v3]
+### [load_cell_v23]
 
 Z homing via a Creality K1-MAX-L_V23 bed load-cell board (CH32V203 + 4x
 CS1237). The board runs Creality's own firmware and command set, not
 Kalico, so it is not configured as an `[mcu]`; this module owns its serial
 port directly and provides its own Z-referencing commands instead of
 registering as a [probe](#probe) or [load_cell_probe](#load_cell_probe).
-See [G-Codes.md](G-Codes.md#prtouch_v3) for the commands this exposes.
+See [G-Codes.md](G-Codes.md#load_cell_v23) for the commands this exposes.
 
 ```
-[prtouch_v3]
+[load_cell_v23]
 serial:
 #   The serial port the board is connected to, e.g. /dev/ttyS9. This
 #   parameter must be provided.
